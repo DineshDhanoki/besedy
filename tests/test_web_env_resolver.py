@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -13,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RESOLVER = REPO_ROOT / "scripts" / "resolve_web_env_file.sh"
 COMPOSE_WRAPPER = REPO_ROOT / "scripts" / "run_web_compose.sh"
 COMPOSE_VALIDATOR = REPO_ROOT / "scripts" / "validate_web_compose_config.sh"
+KEY_CHECK = REPO_ROOT / "scripts" / "check_web_env_keys.sh"
 
 
 @pytest.mark.parametrize(
@@ -656,3 +659,271 @@ def test_compose_validator_accepts_a_jobs_api_that_names_its_own_runtime(
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_resolver_prints_the_mode_template_with_the_template_option() -> None:
+    for mode, example_name in (
+        ("development", ".env.dev.example"),
+        ("production", ".env.prod.example"),
+        ("test", ".env.test.example"),
+    ):
+        result = subprocess.run(
+            ["bash", str(RESOLVER), mode, "--template"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout == f"{REPO_ROOT / 'web' / example_name}\n"
+
+
+def test_scripts_the_compose_wrapper_runs_directly_are_executable_in_git() -> None:
+    # core.fileMode=false hides a missing executable bit locally, and every
+    # wrapper call then fails with "Permission denied" on a fresh checkout.
+    in_git = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if in_git.returncode != 0:
+        pytest.skip("not a git checkout")
+    wrapper = COMPOSE_WRAPPER.read_text(encoding="utf-8")
+    scripts = sorted(set(re.findall(r'"\$script_dir/([A-Za-z0-9_.-]+\.sh)"', wrapper)))
+    assert "check_web_env_keys.sh" in scripts
+
+    listed = subprocess.run(
+        ["git", "ls-files", "-s", "--", *(f"scripts/{name}" for name in scripts)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    modes = {line.split("\t")[1]: line.split()[0] for line in listed}
+
+    assert modes == {f"scripts/{name}": "100755" for name in scripts}
+
+
+SENTINEL = "SENTINEL-VALUE-5f3a"
+
+
+def _fake_compose(bin_dir: Path, rendered: dict[str, object] | None) -> Path:
+    """Fake docker that logs every call.
+
+    `config --format json` prints `rendered` and `config --quiet` succeeds, or
+    both fail the way Compose does on a missing required variable when
+    `rendered` is None. Any other command succeeds silently.
+    """
+    bin_dir.mkdir()
+    calls = bin_dir / "calls.log"
+    rendered_file = bin_dir / "rendered.json"
+    if rendered is not None:
+        rendered_file.write_text(json.dumps(rendered), encoding="utf-8")
+    docker = bin_dir / "docker"
+    docker.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> {calls}
+if [[ " $* " == *" config --format json "* || " $* " == *" config --quiet "* ]]; then
+  if [[ -f {rendered_file} ]]; then
+    [[ " $* " == *" --quiet "* ]] || cat {rendered_file}
+    exit 0
+  fi
+  echo "required variable CONFIG_FILE is missing a value: CONFIG_FILE is required" >&2
+  exit 15
+fi
+""",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    return calls
+
+
+def _run_wrapper(
+    tmp_path: Path, mode: str, override_var: str, env_file: Path, *command: str
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env[override_var] = str(env_file)
+    env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{env['PATH']}"
+    return subprocess.run(
+        ["bash", str(COMPOSE_WRAPPER), mode, *command],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _compose_subcommands(calls: Path) -> list[str]:
+    return [
+        line.split(" --env-file ", 1)[-1].split(" ", 1)[-1]
+        for line in calls.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_web_compose_wrapper_keeps_composes_error_and_points_at_the_template(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / "production.env"
+    env_file.write_text(f"APP_ENV=production\nAUTH_SECRET={SENTINEL}\n", encoding="utf-8")
+    calls = _fake_compose(tmp_path / "bin", None)
+
+    result = _run_wrapper(tmp_path, "production", "BESEDY_WEB_ENV_PROD", env_file, "ps")
+
+    # Compose's error and exit status stand; the wrapper only adds where to look.
+    assert result.returncode == 15
+    assert "required variable CONFIG_FILE is missing a value" in result.stderr
+    assert "`just env-check prod` lists the differences" in result.stderr
+    assert f"env file: {env_file}\n" in result.stderr
+    assert f"template: {REPO_ROOT / 'web' / '.env.prod.example'}\n" in result.stderr
+    assert SENTINEL not in result.stdout + result.stderr
+    assert _compose_subcommands(calls) == ["config --format json"]
+
+
+@pytest.mark.parametrize(
+    ("command", "warns"),
+    [(["up", "-d"], True), (["scale", "web=2"], True), (["ps"], False)],
+)
+def test_web_compose_wrapper_warns_about_unused_keys_only_when_changing_resources(
+    tmp_path: Path, command: list[str], warns: bool
+) -> None:
+    root = tmp_path / "host"
+    (root / "checkout").mkdir(parents=True)
+    env_file = tmp_path / "test.env"
+    env_file.write_text(
+        "APP_ENV=test\n"
+        # Renamed to ARTWORK_DIR.
+        f"POSTERS_DIR={SENTINEL}\n"
+        # Commented out in web/.env.test.example.
+        "VAPID_PUBLIC_KEY=public\n"
+        # Used by the Compose files but not in the template.
+        "WEB_LOGS_DIR=/logs\n"
+        # Used only by another key of the same file.
+        "SOURCE=ready\n"
+        "AUTH_SECRET=${SOURCE}\n",
+        encoding="utf-8",
+    )
+    calls = _fake_compose(tmp_path / "bin", _bind_config("test", root))
+
+    result = _run_wrapper(tmp_path, "test", "BESEDY_WEB_ENV_TEST", env_file, *command)
+
+    assert result.returncode == 0, result.stderr
+    if warns:
+        assert "(renamed or removed?): POSTERS_DIR\n" in result.stderr
+        assert str(REPO_ROOT / "web" / ".env.test.example") in result.stderr
+    else:
+        assert "renamed or removed?" not in result.stderr
+    assert SENTINEL not in result.stdout + result.stderr
+    # The comparison reads files only; it never adds a Compose call.
+    assert _compose_subcommands(calls)[0] == "config --format json"
+    assert not any(" config " in f" {sub} " for sub in _compose_subcommands(calls)[1:])
+
+
+def test_env_check_lists_absent_template_keys_without_failing(tmp_path: Path) -> None:
+    env_file = tmp_path / "production.env"
+    env_file.write_text(f"APP_ENV=production\nAUTH_SECRET={SENTINEL}\n", encoding="utf-8")
+    calls = _fake_compose(tmp_path / "bin", {})
+
+    result = _run_wrapper(tmp_path, "production", "BESEDY_WEB_ENV_PROD", env_file, "env-check")
+
+    # Compose accepts the file, so absent optional keys are only listed.
+    assert result.returncode == 0, result.stderr
+    assert "Compose: accepts this env file\n" in result.stdout
+    absent_line = next(
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith("Template keys the env file does not set (many are optional): ")
+    )
+    assert "CONFIG_FILE" in absent_line.split(": ", 1)[1].split()
+    assert "Env file keys that neither the template" in result.stdout
+    assert SENTINEL not in result.stdout + result.stderr
+    assert _compose_subcommands(calls) == ["config --quiet"]
+
+
+def test_env_check_exit_status_is_composes_verdict(tmp_path: Path) -> None:
+    env_file = tmp_path / "test.env"
+    env_file.write_text(f"APP_ENV=test\nPOSTERS_DIR={SENTINEL}\n", encoding="utf-8")
+    _fake_compose(tmp_path / "bin", None)
+
+    result = _run_wrapper(tmp_path, "test", "BESEDY_WEB_ENV_TEST", env_file, "env-check")
+
+    assert result.returncode == 1
+    assert "required variable CONFIG_FILE is missing a value" in result.stderr
+    assert "Compose: rejects this env file" in result.stdout
+    assert (
+        "Env file keys that neither the template, the Compose files, nor another key uses: "
+        "POSTERS_DIR\n"
+    ) in result.stdout
+    assert SENTINEL not in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(shutil.which("just") is None, reason="requires just")
+@pytest.mark.parametrize(
+    ("alias", "mode", "override_var", "template"),
+    [
+        ("dev", "development", "BESEDY_WEB_ENV_DEV", ".env.dev.example"),
+        ("prod", "production", "BESEDY_WEB_ENV_PROD", ".env.prod.example"),
+        ("test", "test", "BESEDY_WEB_ENV_TEST", ".env.test.example"),
+        ("development", "development", "BESEDY_WEB_ENV_DEV", ".env.dev.example"),
+    ],
+)
+def test_env_check_recipe_accepts_short_and_long_mode_names(
+    tmp_path: Path, alias: str, mode: str, override_var: str, template: str
+) -> None:
+    env_file = tmp_path / f"{mode}.env"
+    env_file.write_text(f"APP_ENV={mode}\n", encoding="utf-8")
+    calls = _fake_compose(tmp_path / "bin", {})
+
+    env = os.environ.copy()
+    env[override_var] = str(env_file)
+    env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{env['PATH']}"
+    # The Justfile runs recipes in a login shell, whose profile may reset PATH
+    # and hide the fake docker; a plain shell keeps it first.
+    result = subprocess.run(
+        ["just", "--shell", "bash", "--shell-arg", "-c", "env-check", alias],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"Template: {REPO_ROOT / 'web' / template}\n" in result.stdout
+    assert calls.exists()
+
+
+def _compose_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    return (
+        subprocess.run(["docker", "compose", "version"], capture_output=True, check=False).returncode
+        == 0
+    )
+
+
+@pytest.mark.skipif(not _compose_available(), reason="requires docker compose")
+def test_env_check_on_the_test_template_with_real_compose(tmp_path: Path) -> None:
+    template = (REPO_ROOT / "web" / ".env.test.example").read_text(encoding="utf-8")
+    env_file = tmp_path / "test.env"
+    env_file.write_text(template + f"POSTERS_DIR={SENTINEL}\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["BESEDY_WEB_ENV_TEST"] = str(env_file)
+    result = subprocess.run(
+        ["bash", str(COMPOSE_WRAPPER), "test", "env-check"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Template keys the env file does not set (many are optional): none\n" in result.stdout
+    assert (
+        "Env file keys that neither the template, the Compose files, nor another key uses: "
+        "POSTERS_DIR\n"
+    ) in result.stdout
+    assert SENTINEL not in result.stdout + result.stderr

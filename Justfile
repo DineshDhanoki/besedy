@@ -391,6 +391,12 @@ dev_compose := "bash ../scripts/run_web_compose.sh development"
 prod_compose := "bash ../scripts/run_web_compose.sh production"
 test_compose := "bash ../scripts/run_web_compose.sh test"
 
+# Compares key names only and exits with Compose's own verdict on the env
+# file. mode: dev, prod, or test (or the long names).
+# Compare a mode's env file with its template
+env-check mode:
+    bash scripts/run_web_compose.sh {{ if mode == "dev" { "development" } else if mode == "prod" { "production" } else { mode } }} env-check
+
 # Start dev environment (detached)
 dev-up:
     cd web && {{ dev_compose }} up -d

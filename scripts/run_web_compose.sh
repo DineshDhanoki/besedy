@@ -198,9 +198,52 @@ compose_command=(
   --env-file "$env_file"
 )
 
-rendered_config="$("${compose_command[@]}" config --format json)"
+# Env files are copied once from their template and drift as it changes.
+# Compose alone decides whether an env file is usable; when it rejects one, the
+# wrapper keeps Compose's error and exit status and points at the template.
+# check_web_env_keys.sh compares key names only (never values) with the
+# template and the Compose files. "env-check" prints that comparison.
+env_template="$("$script_dir/resolve_web_env_file.sh" "$mode" --template)"
+compose_files=()
+for (( i = 0; i < ${#compose_args[@]}; i++ )); do
+  if [[ "${compose_args[$i]}" == "-f" ]]; then
+    compose_files+=("$repo_root/web/${compose_args[$((i + 1))]}")
+  fi
+done
+case "$mode" in
+  development) short_mode="dev" ;;
+  production) short_mode="prod" ;;
+  *) short_mode="$mode" ;;
+esac
+
+if [[ "$compose_command_name" == "env-check" ]]; then
+  # The exit status is Compose's own verdict; the lists only show drift.
+  compose_status=0
+  "${compose_command[@]}" config --quiet || compose_status=$?
+  exec "$script_dir/check_web_env_keys.sh" report "$mode" "$env_file" "$env_template" \
+    "$compose_status" "${compose_files[@]}"
+fi
+
+compose_status=0
+rendered_config="$("${compose_command[@]}" config --format json)" || compose_status=$?
+if (( compose_status != 0 )); then
+  cat >&2 <<MSG
+Compare the $mode env file with its template; \`just env-check $short_mode\` lists the differences.
+  env file: $env_file
+  template: $env_template
+MSG
+  exit "$compose_status"
+fi
 printf '%s\n' "$rendered_config" \
   | "$script_dir/validate_web_compose_config.sh" "$mode" "$instance" "$internal_network"
+
+# Keys nothing uses any more are usually renamed ones, which Compose ignores
+# silently. Warn only when containers are created or changed (up, create, run,
+# scale, watch), so ps, logs, and exec stay quiet.
+if [[ "$changes_resources" == true ]]; then
+  "$script_dir/check_web_env_keys.sh" unknown "$mode" "$env_file" "$env_template" 0 \
+    "${compose_files[@]}" || true
+fi
 
 # The Docker daemon creates a missing bind-mount source, and a mountpoint
 # inside the bind-mounted checkout, as root. Later host commands (npm ci,

@@ -25,6 +25,21 @@ unrelated shell state, fixes the Compose identity independently from runtime
 `APP_ENV`, and validates the fully rendered configuration before Docker can
 create, replace, stop, or remove resources.
 
+Env files are copied once from their template and drift as the template changes.
+Compose alone decides whether an env file is usable. When Compose rejects one,
+the wrapper keeps Compose's error and exit status and adds the env file and
+template paths to compare. On `up`, `create`, `run`, `scale` and `watch` it also
+warns (via `scripts/check_web_env_keys.sh`) about keys that neither the template,
+the mode's Compose files, nor another key of the same file use, which usually
+means a key was renamed or removed; the warning never fails a command.
+`just env-check <dev|prod|test>` prints Compose's verdict, the template keys the
+env file does not set (many are optional), and those unused keys, and exits with
+Compose's verdict. It does not say which keys are required: Compose names a
+missing required key in its own error. Only key names are compared or printed,
+never values, and names come from plain `KEY=value` lines, so unusual dotenv
+syntax (`KEY: value`, multi-line quoted values) can make the advisory lists miss
+or invent a name.
+
 ---
 
 ## Development Setup
