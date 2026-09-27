@@ -76,6 +76,7 @@ interface RecordingAudioSectionProps {
   downloadEventId?: number;
   currentTimeSetter: (time: number) => void;
   hash: string;
+  headingContext?: RecordingHeadingContext;
   onAudioDownload: (source: "archived" | "original") => void;
   onAudioEnded: (duration: number) => void;
   onDurationChange: (duration: number) => void;
@@ -156,14 +157,16 @@ export function RecordingPageState({ afterAudioPlayer, backToListUrl, catalogId,
   );
 }
 
-export function RecordingHeader({
-  hash,
-  headingContext,
-  headerActions,
-  headerIdentity,
-  hideDefaultRecorder = false,
-  recording,
-}: RecordingHeaderProps) {
+/**
+ * The recording's heading parts (title · date · location), the title shown
+ * when none of them exist, and the heading as one line of text. The lock
+ * screen uses the same heading as the page.
+ */
+function useRecordingHeading(
+  recording: CatalogEntryResponse,
+  hash: string,
+  headingContext: RecordingHeadingContext | undefined,
+) {
   const locale = useLocale();
   const { dateYear, dateMonth, dateDay, locationName } = headingContext ?? {
     dateYear: recording.dateYear,
@@ -183,6 +186,19 @@ export function RecordingHeader({
   // Older offline snapshots fall back to the audio hash when there is no title.
   const sourceTitle = recording.title?.trim();
   const fallbackTitle = (sourceTitle !== hash && sourceTitle) || recording.filename || hash.slice(0, 16);
+  const headingText = headingParts.length > 0 ? headingParts.join(" · ") : fallbackTitle;
+  return { headingParts, fallbackTitle, headingText };
+}
+
+export function RecordingHeader({
+  hash,
+  headingContext,
+  headerActions,
+  headerIdentity,
+  hideDefaultRecorder = false,
+  recording,
+}: RecordingHeaderProps) {
+  const { headingParts, fallbackTitle } = useRecordingHeading(recording, hash, headingContext);
   const defaultRecorderIdentity =
     recording.recorder && !hideDefaultRecorder ? (
       <div className="inline-flex max-w-full items-center gap-2 text-sm text-muted-foreground">
@@ -228,6 +244,7 @@ export function RecordingAudioSection({
   downloadEventId,
   currentTimeSetter,
   hash,
+  headingContext,
   onAudioDownload,
   onAudioEnded,
   onDurationChange,
@@ -241,6 +258,7 @@ export function RecordingAudioSection({
   sources,
 }: RecordingAudioSectionProps) {
   const t = useTranslations();
+  const { headingText } = useRecordingHeading(recording, hash, headingContext);
 
   return (
     <div className="space-y-4 mb-6">
@@ -284,6 +302,11 @@ export function RecordingAudioSection({
         seekKey={seekRequest?.key}
         playbackEnd={seekRequest?.end}
         autoPlayOnSeek={autoPlayOnSeek}
+        mediaMetadata={{
+          title: headingText,
+          artist: recording.curatedArtist ?? recording.artist ?? undefined,
+          album: recording.album?.name,
+        }}
       />
 
       {(permissions.canEditMetadata ||
