@@ -1,7 +1,8 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { EventDetail } from "@/components/catalog/event-detail";
+import { ApiError } from "@/lib/api/fetch-json";
 import type { EventDetailResponse } from "@/types/event-detail";
 
 const CATALOG_ID = "20260101_120000";
@@ -83,6 +84,15 @@ function eventDetail(overrides: Partial<EventDetailResponse> = {}): EventDetailR
 
 function renderEventDetail(data: EventDetailResponse) {
   useQueryMock.mockReturnValue({ data, isLoading: false, error: null });
+  renderComponent();
+}
+
+function renderEventDetailError(error: unknown, refetch = vi.fn()) {
+  useQueryMock.mockReturnValue({ data: undefined, isLoading: false, error, refetch, isFetching: false });
+  renderComponent();
+}
+
+function renderComponent() {
   render(
     <EventDetail
       catalogId={CATALOG_ID}
@@ -120,5 +130,43 @@ describe("EventDetail recording heading", () => {
     const content = screen.getByTestId("recording-content");
     expect(content).not.toHaveTextContent("Library, Jun 2006");
     expect(content).toHaveTextContent("Event description");
+  });
+});
+
+describe("EventDetail load failures", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("shows a not-found state with a way back to the events list", () => {
+    renderEventDetailError(new ApiError("Catalog event not found", 404));
+
+    expect(screen.getByRole("heading", { name: "notFoundTitle" })).toBeInTheDocument();
+    expect(screen.getByText("notFoundDescription")).toBeInTheDocument();
+    expect(screen.queryByText(/Catalog event not found/)).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /backToEvents/ })).toHaveAttribute(
+      "href",
+      `/catalog/${CATALOG_ID}?tab=events`
+    );
+    expect(screen.queryByRole("button", { name: /retry/ })).not.toBeInTheDocument();
+  });
+
+  it("treats an event hidden with 403 as not found", () => {
+    renderEventDetailError(new ApiError("Forbidden", 403));
+
+    expect(screen.getByRole("heading", { name: "notFoundTitle" })).toBeInTheDocument();
+    expect(screen.queryByText("Forbidden")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/ })).not.toBeInTheDocument();
+  });
+
+  it("offers a retry for other failures without showing the raw error", () => {
+    const refetch = vi.fn();
+    renderEventDetailError(new ApiError("Internal error", 500), refetch);
+
+    expect(screen.getByRole("heading", { name: "loadErrorTitle" })).toBeInTheDocument();
+    expect(screen.getByText("errors.serverErrorDescription")).toBeInTheDocument();
+    expect(screen.queryByText("Internal error")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /retry/ }));
+    expect(refetch).toHaveBeenCalledTimes(1);
   });
 });

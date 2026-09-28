@@ -5,10 +5,19 @@ import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, FolderOpen, Image as ImageIcon, Mic, Pencil } from "lucide-react";
+import {
+  ArrowLeft,
+  CalendarX,
+  ChevronDown,
+  FolderOpen,
+  Image as ImageIcon,
+  Mic,
+  Pencil,
+  RefreshCw,
+} from "lucide-react";
 import RecordingContent from "@/app/(app)/catalog/[catalogId]/recording/[hash]/recording-content";
 import { formatPartialDate } from "@/lib/date-format";
-import { fetchJson } from "@/lib/api/fetch-json";
+import { ApiError, fetchJson } from "@/lib/api/fetch-json";
 import { buildEventDetailUrl } from "@/lib/api/recording-urls";
 import { readLocalEventDetail, withLocalFallback } from "@/lib/offline/local-source";
 import { useLocalArtworkUrl } from "@/hooks/use-local-package";
@@ -49,7 +58,7 @@ export function EventDetail({ catalogId, eventId, canEdit, showAllColumns, showR
   const [selectedHash, setSelectedHash] = useState<string>("");
   const handledReadOnlyRef = useRef<string | null>(null);
 
-  const { data, isLoading, error } = useQuery<EventDetailResponse>({
+  const { data, isLoading, error, refetch, isFetching } = useQuery<EventDetailResponse>({
     queryKey: ["catalog-event-detail", eventId],
     // Network first; a complete local package answers when the request itself
     // cannot be made, so the same page renders online and offline.
@@ -112,11 +121,31 @@ export function EventDetail({ catalogId, eventId, canEdit, showAllColumns, showR
   }
 
   if (error || !data) {
+    // A hidden event answers 403 or 404; either way there is nothing to retry.
+    const isNotFound = error instanceof ApiError && (error.status === 404 || error.status === 403);
     return (
-      <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 text-sm text-destructive">
-        {t("loadError", {
-          message: error instanceof Error ? error.message : t("unknownError"),
-        })}
+      <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-4 pb-6 sm:pt-6">
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <CalendarX className="h-12 w-12 text-muted-foreground mb-4" />
+          <h1 className="text-lg font-semibold">{isNotFound ? t("notFoundTitle") : t("loadErrorTitle")}</h1>
+          <p className="text-sm text-muted-foreground mt-2 max-w-md">
+            {isNotFound ? t("notFoundDescription") : tRoot("errors.serverErrorDescription")}
+          </p>
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
+            <Button asChild variant={isNotFound ? "default" : "outline"}>
+              <Link href={`/catalog/${catalogId}?tab=events`}>
+                <ArrowLeft className="mr-2 h-4 w-4" />
+                {t("backToEvents")}
+              </Link>
+            </Button>
+            {!isNotFound && (
+              <Button onClick={() => void refetch()} disabled={isFetching}>
+                <RefreshCw className="mr-2 h-4 w-4" />
+                {t("retry")}
+              </Button>
+            )}
+          </div>
+        </div>
       </div>
     );
   }
